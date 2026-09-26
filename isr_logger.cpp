@@ -16,12 +16,10 @@ static volatile uint16_t tail = 0;
 static volatile bool overflow_flag = false;
 
 void isr_log_push(const LogData& data) {
-    // 【極小クリティカルセクション】 Mbed OS標準の軽量排他ロック
+    // 【極小クリティカルセクション】
     core_util_critical_section_enter();
 
     log_buffer[head] = data;
-    
-    // 割り算(%)を使わずビット演算(&)で高速にラップアラウンド計算
     uint16_t next_head = (head + 1) & LOG_BUFFER_MASK;
 
     if (next_head == tail) {
@@ -45,9 +43,13 @@ void isr_log_process() {
     }
     core_util_critical_section_exit();
 
-    // あふれ検知時の告知
+    // 出力結合用のローカルバッファ (サイズは用途に応じて調整してください)
+    char out_buf[512];
+    size_t offset = 0;
+    out_buf[0] = '\0';
+
     if (local_overflow) {
-        printf("[OVERFLOW_DETECTED] Some ISR logs were dropped.\n");
+        offset += snprintf(out_buf + offset, sizeof(out_buf) - offset, "[OVERFLOW_DETECTED] Some ISR logs were dropped.\n");
     }
 
     // キューが空になるまで処理を継続
@@ -65,36 +67,57 @@ void isr_log_process() {
         core_util_critical_section_exit();
 
         if (!has_data) {
-            break; // バッファが空なら終了
+            break; // バッファが空ならループ終了
         }
 
-        // ここから下はクリティカルセクション外。ISRを一切ブロックせずに時間をかけてシリアル送信する
+        // 【安全対策】バッファの残り容量が少ない場合は、一度フラッシュして空にする
+        // (長い文字列が来た場合に備えて64バイト程度の余裕を持たせる)
+        if (sizeof(out_buf) - offset < 64) {
+            printf("%s", out_buf);
+            offset = 0;
+            out_buf[0] = '\0';
+        }
+
+        // バッファの末尾(out_buf + offset)に文字列を追記していく
+        int written = 0;
         switch (d.tag) {
             case LogTag::INT:
-                printf("%d ", d.val.i);
+                written = snprintf(out_buf + offset, sizeof(out_buf) - offset, "%d ", d.val.i);
                 break;
             case LogTag::FLOAT:
-                printf("%.3f ", d.val.f); // 用途に合わせて桁数は調整してください
+                written = snprintf(out_buf + offset, sizeof(out_buf) - offset, "%.3f ", d.val.f);
                 break;
             case LogTag::MSG:
-                printf("%s ", d.str);
+                written = snprintf(out_buf + offset, sizeof(out_buf) - offset, "%s ", d.str);
                 break;
             case LogTag::WARN:
-                printf("[WARN] %s ", d.str);
+                written = snprintf(out_buf + offset, sizeof(out_buf) - offset, "[WARN] %s ", d.str);
                 break;
             case LogTag::ERR:
-                printf("[ERROR] %s ", d.str);
+                written = snprintf(out_buf + offset, sizeof(out_buf) - offset, "[ERROR] %s ", d.str);
                 break;
             case LogTag::TELEPLOT_INT:
-                printf(">%s:%d\n", d.str, d.val.i);
+                written = snprintf(out_buf + offset, sizeof(out_buf) - offset, ">%s:%d\n", d.str, d.val.i);
                 break;
             case LogTag::TELEPLOT_FLOAT:
-                printf(">%s:%.3f\n", d.str, d.val.f);
+                written = snprintf(out_buf + offset, sizeof(out_buf) - offset, ">%s:%.3f\n", d.str, d.val.f);
                 break;
             case LogTag::ENDL:
-                printf("\n");
+                written = snprintf(out_buf + offset, sizeof(out_buf) - offset, "\n");
                 break;
         }
+
+        // 書き込んだ文字数分だけオフセットを進める
+        if (written > 0) {
+            // 万が一バッファ上限に達した場合のフェイルセーフ
+            size_t max_writable = sizeof(out_buf) - offset - 1;
+            offset += (static_cast<size_t>(written) < max_writable) ? written : max_writable;
+        }
+    }
+
+    // 最後に残っている文字列を1回のprintfで出力
+    if (offset > 0) {
+        printf("%s", out_buf);
     }
 }
 
